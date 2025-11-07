@@ -1,0 +1,70 @@
+{
+
+  "name": "pagina-web-demo",
+
+  "version": "1.0.0",
+
+  "main": "form-handler.js",
+
+  "scripts": {
+
+    "test": "echo \"Error: no test specified\" && exit 1",
+
+    "start": "node server.js",
+
+    "build": "echo 'skip build'"
+
+  },
+
+  "repository": {
+
+    "type": "git",
+
+    "url": "git+https://github.com/otpvayne/Pagina-web-demo.git"
+
+  },
+
+  "keywords": [],
+
+  "author": "",
+
+  "license": "ISC",
+
+  "bugs": {
+
+    "url": "https://github.com/otpvayne/Pagina-web-demo/issues"
+
+  },
+
+  "homepage": "https://github.com/otpvayne/Pagina-web-demo#readme",
+
+  "description": "",
+
+  "dependencies": {
+
+    "@libsql/client": "^0.15.4",
+
+    "cors": "^2.8.5",
+
+    "dotenv": "^16.5.0",
+
+    "express": "^5.1.0",
+
+    "googleapis": "^148.0.0",
+
+    "json2csv": "^6.0.0-alpha.2",
+
+    "multer": "^1.4.5-lts.2",
+
+    "nodemailer": "^7.0.5"
+
+  },
+
+  "engines": {
+
+    "node": "18.x"
+
+  }
+
+}
+
