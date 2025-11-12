@@ -11,13 +11,39 @@ const fs = require('fs');
 const app = express();
 
 // ====== CORS (Render + Vercel) ======
-const ALLOWED_ORIGINS = [
-  'https://casa-kumis-frontend.vercel.app',
-  'https://casa-kumis-frontend.onrender.com',
+const ALLOWED_STATIC = new Set([
+  'https://casa-kumis-frontend.vercel.app',      // producción (dominio principal)
+  'https://casa-kumis-frontend.onrender.com',    // si tuvieras un mirror en Render
   'http://localhost:5173',
   'http://127.0.0.1:5173',
   'http://localhost:5500'
-];
+]);
+
+function isAllowedOrigin(origin) {
+  if (!origin) return true; // healthchecks/curl
+  if (ALLOWED_STATIC.has(origin)) return true;
+
+  // ✅ Permite TODOS los previews del mismo proyecto en Vercel
+  // (casa-kumis-frontend-xxxxx.vercel.app)
+  const urlOk =
+    origin.startsWith('https://casa-kumis-frontend-') &&
+    origin.endsWith('.vercel.app');
+
+  return urlOk;
+}
+
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  if (!origin || isAllowedOrigin(origin)) {
+    res.header('Access-Control-Allow-Origin', origin || '*');
+  }
+  res.header('Vary', 'Origin');
+  res.header('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
+
 
 app.use((req, res, next) => {
   const origin = req.headers.origin;
