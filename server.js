@@ -1,7 +1,6 @@
 require('dotenv').config();
 
 const express = require('express');
-const cors = require('cors');
 const multer = require('multer');
 const { google } = require('googleapis');
 const { createClient } = require('@libsql/client');
@@ -11,36 +10,39 @@ const fs = require('fs');
 
 const app = express();
 
-// ====== CORS (ajusta dominios del frontend) ======
-const allowlist = [
-  process.env.FRONTEND_URL_1 || '', // ej: https://casa-kumis-frontend.vercel.app
-  process.env.FRONTEND_URL_2 || '', // ej: https://casa-kumis-frontend.onrender.com
+// ====== CORS (Render + Vercel) ======
+const ALLOWED_ORIGINS = [
+  'https://casa-kumis-frontend.vercel.app',
+  'https://casa-kumis-frontend.onrender.com',
   'http://localhost:5173',
   'http://127.0.0.1:5173',
   'http://localhost:5500'
-].filter(Boolean);
+];
 
-app.use(cors({
-  origin: (origin, cb) => {
-    if (!origin) return cb(null, true); // permite curl/healthchecks
-    if (allowlist.includes(origin)) return cb(null, true);
-    return cb(new Error('Not allowed by CORS'));
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  if (!origin || ALLOWED_ORIGINS.includes(origin)) {
+    res.header('Access-Control-Allow-Origin', origin || '*');
   }
-}));
+  res.header('Vary', 'Origin');
+  res.header('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
 
-// ====== STATIC SOLO EN LOCAL (si existe ./public) ======
+// ====== STATIC SOLO EN LOCAL (para pruebas) ======
 const publicDir = path.join(__dirname, 'public');
 if (process.env.NODE_ENV !== 'production' && fs.existsSync(publicDir)) {
   app.use(express.static(publicDir));
 }
 
-// ====== Turso (SIN migraciones de arranque) ======
+// ====== Turso (ya con tablas creadas) ======
 const turso = createClient({
   url: process.env.TURSO_URL,
   authToken: process.env.TURSO_TOKEN
 });
 
-// Comprobación simple de conexión (no crea tablas)
 (async () => {
   try {
     await turso.execute('SELECT 1;');
@@ -50,7 +52,7 @@ const turso = createClient({
   }
 })();
 
-// ====== Google Drive auth ======
+// ====== Google Drive Auth ======
 const auth = new google.auth.JWT({
   email: process.env.GOOGLE_CLIENT_EMAIL,
   key: (process.env.GOOGLE_PRIVATE_KEY || '').replace(/\\n/g, '\n'),
@@ -58,15 +60,19 @@ const auth = new google.auth.JWT({
 });
 const drive = google.drive({ version: 'v3', auth });
 
-// ====== Multer (memoria) ======
+// ====== Multer (para subir archivos en memoria) ======
 const upload = multer({ storage: multer.memoryStorage() });
 
-// ====== Mail helper ======
+// ====== Helper para enviar correos ======
 async function enviarCorreo({ to, subject, html }) {
   const transporter = nodemailer.createTransport({
     service: 'gmail',
-    auth: { user: process.env.EMAIL_FROM, pass: process.env.EMAIL_PASS }
+    auth: {
+      user: process.env.EMAIL_FROM,
+      pass: process.env.EMAIL_PASS
+    }
   });
+
   await transporter.sendMail({
     from: `"La Casa del Kumis" <${process.env.EMAIL_FROM}>`,
     to,
@@ -75,12 +81,12 @@ async function enviarCorreo({ to, subject, html }) {
   });
 }
 
-// ====== Rutas ======
+// ====== Health check ======
 app.get('/health', (req, res) => {
   res.status(200).json({ ok: true, ts: new Date().toISOString() });
 });
 
-// POST /api/formulario  (postulaciones con archivo)
+// ====== POST /api/formulario ======
 app.post('/api/formulario', upload.single('archivo'), async (req, res) => {
   try {
     const { nombre, email, telefono, cargo, mensaje } = req.body;
@@ -91,7 +97,6 @@ app.post('/api/formulario', upload.single('archivo'), async (req, res) => {
     const fileMetadata = { name: archivo.originalname };
     const media = { mimeType: archivo.mimetype, body: Readable.from(archivo.buffer) };
 
-    // Subir a Drive
     const result = await drive.files.create({
       resource: fileMetadata,
       media,
@@ -99,20 +104,15 @@ app.post('/api/formulario', upload.single('archivo'), async (req, res) => {
     });
     const fileId = result.data.id;
 
-    // Mover a carpeta
-    const FOLDER_ID = process.env.GOOGLE_FOLDER_ID;
-    if (FOLDER_ID) {
-      await drive.files.update({ fileId, addParents: FOLDER_ID });
-    }
-
-    // Público
+    await drive.files.update({ fileId, addParents: process.env.GOOGLE_FOLDER_ID });
     await drive.permissions.create({
       fileId,
       requestBody: { role: 'reader', type: 'anyone' }
     });
-    const fileUrl = `https://drive.google.com/file/d/${fileId}/view`;
 
+    const fileUrl = `https://drive.google.com/file/d/${fileId}/view`;
     const fecha = new Date().toISOString();
+
     await turso.execute({
       sql: `
         INSERT INTO postulaciones (nombre, email, telefono, cargo, mensaje, archivo_url, fecha_envio)
@@ -121,27 +121,22 @@ app.post('/api/formulario', upload.single('archivo'), async (req, res) => {
       args: [nombre, email, telefono, cargo, mensaje || '', fileUrl, fecha]
     });
 
-    // Email notificación
-    try {
-      await enviarCorreo({
-        to: [process.env.EMAIL_TO, process.env.EMAIL_CC].filter(Boolean),
-        subject: `📩 Nueva postulación - ${nombre}`,
-        html: `
-          <h2>📋 Nueva postulación</h2>
-          <ul>
-            <li><b>Nombre:</b> ${nombre}</li>
-            <li><b>Correo:</b> ${email}</li>
-            <li><b>Teléfono:</b> ${telefono}</li>
-            <li><b>Cargo:</b> ${cargo}</li>
-            <li><b>Mensaje:</b> ${mensaje || '(Sin mensaje)'}</li>
-            <li><b>Archivo:</b> <a href="${fileUrl}" target="_blank">Ver archivo</a></li>
-            <li><b>Fecha:</b> ${new Date(fecha).toLocaleString('es-CO', { timeZone: 'America/Bogota' })}</li>
-          </ul>
-        `
-      });
-    } catch (mailErr) {
-      console.warn('⚠️ Email no enviado:', mailErr.message);
-    }
+    await enviarCorreo({
+      to: [process.env.EMAIL_TO, process.env.EMAIL_CC].filter(Boolean),
+      subject: `📩 Nueva postulación - ${nombre}`,
+      html: `
+        <h2>📋 Nueva postulación</h2>
+        <ul>
+          <li><b>Nombre:</b> ${nombre}</li>
+          <li><b>Correo:</b> ${email}</li>
+          <li><b>Teléfono:</b> ${telefono}</li>
+          <li><b>Cargo:</b> ${cargo}</li>
+          <li><b>Mensaje:</b> ${mensaje || '(Sin mensaje)'}</li>
+          <li><b>Archivo:</b> <a href="${fileUrl}" target="_blank">Ver archivo</a></li>
+          <li><b>Fecha:</b> ${new Date(fecha).toLocaleString('es-CO', { timeZone: 'America/Bogota' })}</li>
+        </ul>
+      `
+    });
 
     res.status(200).send('Formulario enviado con éxito.');
   } catch (error) {
@@ -150,7 +145,7 @@ app.post('/api/formulario', upload.single('archivo'), async (req, res) => {
   }
 });
 
-// GET /api/descargar-postulaciones (CSV)
+// ====== GET /api/descargar-postulaciones ======
 const { Parser } = require('json2csv');
 app.get('/api/descargar-postulaciones', async (req, res) => {
   try {
@@ -165,10 +160,7 @@ app.get('/api/descargar-postulaciones', async (req, res) => {
       Cargo: r.cargo,
       Mensaje: r.mensaje,
       'Archivo (Google Drive)': r.archivo_url,
-      'Fecha de Envío': new Date(r.fecha_envio).toLocaleString('es-CO', {
-        timeZone: 'America/Bogota',
-        hour12: true
-      })
+      'Fecha de Envío': new Date(r.fecha_envio).toLocaleString('es-CO', { timeZone: 'America/Bogota', hour12: true })
     }));
 
     const parser = new Parser({ fields: Object.keys(dataLimpia[0]), delimiter: ';' });
@@ -184,7 +176,7 @@ app.get('/api/descargar-postulaciones', async (req, res) => {
   }
 });
 
-// POST /api/quejas (archivo opcional)
+// ====== POST /api/quejas ======
 app.post('/api/quejas', upload.single('archivo'), async (req, res) => {
   try {
     const { nombre, email, telefono, sucursal, asunto, mensaje } = req.body;
@@ -220,24 +212,20 @@ app.post('/api/quejas', upload.single('archivo'), async (req, res) => {
       args: [nombre, email, telefono, sucursal, asunto, mensaje || '', fileUrl, fecha]
     });
 
-    try {
-      await enviarCorreo({
-        to: [process.env.EMAIL_TO, process.env.EMAIL_CC].filter(Boolean),
-        subject: `[QUEJA] ${asunto} - ${nombre}`,
-        html: `
-          <h2>Formulario de Quejas</h2>
-          <p><b>Nombre:</b> ${nombre}</p>
-          <p><b>Email:</b> ${email}</p>
-          <p><b>Teléfono:</b> ${telefono}</p>
-          <p><b>Sucursal:</b> ${sucursal}</p>
-          <p><b>Asunto:</b> ${asunto}</p>
-          <p><b>Mensaje:</b><br>${mensaje || ''}</p>
-          ${fileUrl ? `<p><b>Archivo:</b> <a href="${fileUrl}" target="_blank">Ver archivo</a></p>` : ''}
-        `
-      });
-    } catch (mailErr) {
-      console.warn('⚠️ Email no enviado (quejas):', mailErr.message);
-    }
+    await enviarCorreo({
+      to: [process.env.EMAIL_TO, process.env.EMAIL_CC].filter(Boolean),
+      subject: `[QUEJA] ${asunto} - ${nombre}`,
+      html: `
+        <h2>Formulario de Quejas</h2>
+        <p><b>Nombre:</b> ${nombre}</p>
+        <p><b>Email:</b> ${email}</p>
+        <p><b>Teléfono:</b> ${telefono}</p>
+        <p><b>Sucursal:</b> ${sucursal}</p>
+        <p><b>Asunto:</b> ${asunto}</p>
+        <p><b>Mensaje:</b><br>${mensaje || ''}</p>
+        ${fileUrl ? `<p><b>Archivo:</b> <a href="${fileUrl}" target="_blank">Ver archivo</a></p>` : ''}
+      `
+    });
 
     res.status(200).send('✅ Queja enviada con éxito');
   } catch (err) {
