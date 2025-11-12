@@ -1,217 +1,260 @@
-// server.js
-import 'dotenv/config';
-import express from 'express';
-import cors from 'cors';
-import multer from 'multer';
-import crypto from 'crypto';
-import nodemailer from 'nodemailer';
-import { google } from 'googleapis';
-import { createClient } from '@libsql/client';
+require('dotenv').config();
+
+const express = require('express');
+const cors = require('cors');
+const multer = require('multer');
+const { google } = require('googleapis');
+const { createClient } = require('@libsql/client'); // Turso
+const nodemailer = require('nodemailer');
+const path = require('path');
+const { Parser } = require('json2csv');
 
 const app = express();
 
-// --- CORS (ajusta origen para producción si usas dominio propio) ---
-app.use(cors({ origin: true }));
+// -------- Middlewares base --------
+app.use(cors());
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+app.use(express.static(path.join(__dirname, 'public')));
 
-// --- Multer (memoria, 10 MB máx) ---
-const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: 10 * 1024 * 1024 }, // 10MB
-  fileFilter: (_req, file, cb) => {
-    // whitelist simple (puedes ampliar)
-    const ok = [
-      'application/pdf',
-      'application/msword',
-      'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-      'image/jpeg',
-      'image/png'
-    ].includes(file.mimetype);
-    cb(ok ? null : new Error('Tipo de archivo no permitido'));
-  }
-});
-
-// --- LibSQL/Turso ---
-const db = createClient({
+// -------- Turso (BD) --------
+const turso = createClient({
   url: process.env.TURSO_URL,
-  authToken: process.env.TURSO_TOKEN
+  authToken: process.env.TURSO_TOKEN,
 });
 
-// --- Google Drive (Service Account) ---
+// Crea tablas si no existen
+(async () => {
+  await turso.execute(`
+    CREATE TABLE IF NOT EXISTS postulaciones (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      nombre TEXT,
+      email TEXT,
+      telefono TEXT,
+      cargo TEXT,
+      mensaje TEXT,
+      archivo_url TEXT,
+      fecha_envio TEXT
+    );
+  `);
+
+  await turso.execute(`
+    CREATE TABLE IF NOT EXISTS quejas (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      nombre TEXT,
+      email TEXT,
+      telefono TEXT,
+      sucursal TEXT,
+      asunto TEXT,
+      mensaje TEXT,
+      archivo_url TEXT,
+      fecha_envio TEXT
+    );
+  `);
+})().catch(err => console.error('Error creando tablas:', err));
+
+// -------- Google Drive --------
 const auth = new google.auth.JWT({
   email: process.env.GOOGLE_CLIENT_EMAIL,
   key: (process.env.GOOGLE_PRIVATE_KEY || '').replace(/\\n/g, '\n'),
-  scopes: ['https://www.googleapis.com/auth/drive.file']
+  scopes: ['https://www.googleapis.com/auth/drive.file'],
 });
 const drive = google.drive({ version: 'v3', auth });
 
-// Helper: subir archivo a Drive
-async function uploadToDrive(buffer, filename, mimetype, parentFolderId) {
-  if (!buffer) return { id: null, url: null };
+const FOLDER_POSTULACIONES = process.env.GOOGLE_FOLDER_ID;           // Carpeta para /api/formulario
+const FOLDER_QUEJAS = process.env.GOOGLE_FOLDER_QUEJAS_ID || FOLDER_POSTULACIONES;
 
-  const res = await drive.files.create({
-    requestBody: { name: filename, parents: [parentFolderId] },
-    media: { mimeType: mimetype, body: Buffer.from(buffer) }
+// -------- Subida de archivos (memoria) --------
+const upload = multer({ storage: multer.memoryStorage() });
+
+// -------- Correo --------
+async function enviarCorreo({ to, subject, html }) {
+  const transporter = nodemailer.createTransport({
+    service: 'gmail',
+    auth: { user: process.env.EMAIL_FROM, pass: process.env.EMAIL_PASS }, // usa App Password
   });
 
-  const fileId = res.data.id;
+  await transporter.sendMail({
+    from: `"La Casa del Kumis" <${process.env.EMAIL_FROM}>`,
+    to,
+    subject,
+    html,
+  });
+}
 
-  // Compartir con enlace (lectura)
+// -------- Util: subir archivo a Drive y hacerlo público --------
+async function subirAStorageDrive({ buffer, originalname, mimetype, folderId }) {
+  const { Readable } = require('stream');
+
+  // 1) Crear archivo
+  const createRes = await drive.files.create({
+    requestBody: { name: originalname },
+    media: { mimeType: mimetype, body: Readable.from(buffer) },
+    fields: 'id',
+  });
+
+  const fileId = createRes.data.id;
+
+  // 2) Mover a carpeta
+  if (folderId) {
+    await drive.files.update({
+      fileId,
+      addParents: folderId,
+      fields: 'id, parents',
+    });
+  }
+
+  // 3) Hacer público (lector)
   await drive.permissions.create({
     fileId,
-    requestBody: { role: 'reader', type: 'anyone' }
+    requestBody: { role: 'reader', type: 'anyone' },
   });
 
-  const url = `https://drive.google.com/file/d/${fileId}/view`;
-  return { id: fileId, url };
+  return `https://drive.google.com/file/d/${fileId}/view`;
 }
 
-// --- Email (Gmail App Password) ---
-const transporter = nodemailer.createTransport({
-  service: 'gmail',
-  auth: {
-    user: process.env.EMAIL_FROM,
-    pass: process.env.EMAIL_PASS
-  }
-});
-async function sendMail({ subject, html }) {
-  const to = process.env.EMAIL_TO;
-  const cc = process.env.EMAIL_CC || '';
-  await transporter.sendMail({
-    from: `"Casa del Kumis" <${process.env.EMAIL_FROM}>`,
-    to,
-    cc,
-    subject,
-    html
-  });
-}
+// ================== RUTAS API ==================
 
-// --- Util ---
-const genId = () => crypto.randomUUID();
-const nowISO = () => new Date().toISOString();
-
-// Rate-limit MUY simple por IP (opcional)
-const hits = new Map();
-app.use((req, res, next) => {
-  const ip = req.headers['x-forwarded-for']?.toString().split(',')[0] || req.socket.remoteAddress || 'unknown';
-  const k = `${ip}:${new Date().getMinutes()}`;
-  hits.set(k, (hits.get(k) || 0) + 1);
-  if (hits.get(k) > 60) return res.status(429).send('Demasiadas solicitudes. Intenta en 1 minuto.');
-  next();
-});
-
-// ---- ENDPOINT: /api/formulario  (trabaja.html) ----
+// POST /api/formulario  (Trabaja con nosotros)
 app.post('/api/formulario', upload.single('archivo'), async (req, res) => {
   try {
-    const { nombre, email, telefono, cargo, mensaje = '' } = req.body || {};
-    if (!nombre || !email || !telefono || !cargo) {
-      return res.status(400).send('Faltan campos obligatorios.');
-    }
+    const { nombre, email, telefono, cargo, mensaje } = req.body;
 
-    // Subir archivo a la carpeta general de HV
-    const parentFolderId = process.env.GOOGLE_FOLDER_ID;
-    let drive_file_id = null;
-    let drive_file_url = null;
+    // Archivo opcional pero recomendado
+    let fileUrl = '';
     if (req.file) {
-      const safeName = `HV_${nombre.replace(/\s+/g, '_')}_${Date.now()}`;
-      const up = await uploadToDrive(req.file.buffer, safeName, req.file.mimetype, parentFolderId);
-      drive_file_id = up.id;
-      drive_file_url = up.url;
+      fileUrl = await subirAStorageDrive({
+        buffer: req.file.buffer,
+        originalname: req.file.originalname,
+        mimetype: req.file.mimetype,
+        folderId: FOLDER_POSTULACIONES,
+      });
     }
 
-    const id = genId();
-    const ip = req.headers['x-forwarded-for']?.toString().split(',')[0] || req.socket.remoteAddress || null;
-    const ua = req.headers['user-agent'] || null;
+    const fecha = new Date().toISOString();
 
-    await db.execute({
-      sql: `INSERT INTO postulaciones (id, nombre, email, telefono, cargo, mensaje, drive_file_id, drive_file_url, ip, user_agent)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      args: [id, nombre, email, telefono, cargo, mensaje, drive_file_id, drive_file_url, ip, ua]
+    // Guardar en Turso
+    await turso.execute({
+      sql: `
+        INSERT INTO postulaciones (nombre, email, telefono, cargo, mensaje, archivo_url, fecha_envio)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+      `,
+      args: [nombre, email, telefono, cargo, mensaje || '', fileUrl, fecha],
     });
 
-    // Email notificación
-    await sendMail({
-      subject: `Nueva postulación: ${nombre} • ${cargo}`,
-      html: `
-        <h2>Nueva postulación</h2>
-        <ul>
-          <li><b>Nombre:</b> ${nombre}</li>
-          <li><b>Email:</b> ${email}</li>
-          <li><b>Teléfono:</b> ${telefono}</li>
-          <li><b>Cargo:</b> ${cargo}</li>
-          <li><b>Mensaje:</b> ${mensaje || '(sin mensaje)'}</li>
-          <li><b>Archivo:</b> ${drive_file_url ? `<a href="${drive_file_url}">Ver en Drive</a>` : 'No adjunto'}</li>
-          <li><b>Fecha:</b> ${nowISO()}</li>
-        </ul>`
-    });
+    // Correo (opcional pero configurado)
+    if (process.env.EMAIL_TO) {
+      await enviarCorreo({
+        to: [process.env.EMAIL_TO, process.env.EMAIL_CC].filter(Boolean),
+        subject: `📩 Nueva postulación - ${nombre || 'Sin nombre'}`,
+        html: `
+          <h2>📋 Nueva postulación recibida</h2>
+          <ul>
+            <li><strong>Nombre:</strong> ${nombre || '-'}</li>
+            <li><strong>Correo:</strong> ${email || '-'}</li>
+            <li><strong>Teléfono:</strong> ${telefono || '-'}</li>
+            <li><strong>Cargo:</strong> ${cargo || '-'}</li>
+            <li><strong>Mensaje:</strong> ${mensaje || '(Sin mensaje)'}</li>
+            <li><strong>Archivo:</strong> ${fileUrl ? `<a href="${fileUrl}" target="_blank">Ver archivo</a>` : '—'}</li>
+            <li><strong>Fecha:</strong> ${new Date(fecha).toLocaleString('es-CO', { timeZone: 'America/Bogota' })}</li>
+          </ul>
+        `,
+      });
+    }
 
-    // El frontend espera texto
-    return res.status(200).send('OK');
-  } catch (err) {
-    console.error('Error /api/formulario:', err);
-    return res.status(500).send('Error del servidor.');
+    res.status(200).json({ ok: true, message: 'Formulario enviado con éxito.' });
+  } catch (error) {
+    console.error('❌ Error /api/formulario:', error);
+    res.status(500).json({ ok: false, message: 'Error al procesar el formulario.' });
   }
 });
 
-// ---- ENDPOINT: /api/quejas  (quejas.html) ----
+// GET /api/descargar-postulaciones (CSV UTF-8 con BOM y ; para Excel)
+app.get('/api/descargar-postulaciones', async (_req, res) => {
+  try {
+    const result = await turso.execute('SELECT * FROM postulaciones ORDER BY fecha_envio DESC');
+    const registros = result.rows || [];
+    if (!registros.length) return res.status(404).send('No hay postulaciones registradas.');
+
+    const data = registros.map(r => ({
+      Nombre: r.nombre,
+      Correo: r.email,
+      Teléfono: r.telefono,
+      Cargo: r.cargo,
+      Mensaje: r.mensaje,
+      'Archivo (Google Drive)': r.archivo_url,
+      'Fecha de Envío': new Date(r.fecha_envio).toLocaleString('es-CO', { timeZone: 'America/Bogota', hour12: true }),
+    }));
+
+    const parser = new Parser({ fields: Object.keys(data[0]), delimiter: ';' });
+    const csv = '\uFEFF' + parser.parse(data); // BOM
+
+    res.header('Content-Type', 'text/csv; charset=utf-8');
+    res.attachment('postulaciones.csv');
+    res.send(csv);
+  } catch (error) {
+    console.error('❌ Error generando CSV:', error);
+    res.status(500).send('Error al generar el archivo.');
+  }
+});
+
+// POST /api/quejas  (archivo opcional)
 app.post('/api/quejas', upload.single('archivo'), async (req, res) => {
   try {
-    const { nombre, email, telefono, sucursal, asunto, mensaje } = req.body || {};
-    if (!nombre || !email || !telefono || !sucursal || !asunto || !mensaje) {
-      return res.status(400).send('Faltan campos obligatorios.');
-    }
+    const { nombre, email, telefono, sucursal, asunto, mensaje } = req.body;
 
-    // Subir archivo a la carpeta específica de QUEJAS
-    const parentFolderId = process.env.GOOGLE_FOLDER_QUEJAS_ID || process.env.GOOGLE_FOLDER_ID;
-    let drive_file_id = null;
-    let drive_file_url = null;
+    let fileUrl = '';
     if (req.file) {
-      const safeName = `QUEJA_${nombre.replace(/\s+/g, '_')}_${Date.now()}`;
-      const up = await uploadToDrive(req.file.buffer, safeName, req.file.mimetype, parentFolderId);
-      drive_file_id = up.id;
-      drive_file_url = up.url;
+      fileUrl = await subirAStorageDrive({
+        buffer: req.file.buffer,
+        originalname: req.file.originalname,
+        mimetype: req.file.mimetype,
+        folderId: FOLDER_QUEJAS,
+      });
     }
 
-    const id = genId();
-    const ip = req.headers['x-forwarded-for']?.toString().split(',')[0] || req.socket.remoteAddress || null;
-    const ua = req.headers['user-agent'] || null;
+    const fecha = new Date().toISOString();
 
-    await db.execute({
-      sql: `INSERT INTO quejas (id, nombre, email, telefono, sucursal, asunto, mensaje, drive_file_id, drive_file_url, ip, user_agent)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      args: [id, nombre, email, telefono, sucursal, asunto, mensaje, drive_file_id, drive_file_url, ip, ua]
+    await turso.execute({
+      sql: `
+        INSERT INTO quejas (nombre, email, telefono, sucursal, asunto, mensaje, archivo_url, fecha_envio)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `,
+      args: [nombre, email, telefono, sucursal, asunto, mensaje || '', fileUrl, fecha],
     });
 
-    // Email notificación
-    await sendMail({
-      subject: `Nuevo mensaje (${asunto}) de ${nombre}`,
-      html: `
-        <h2>Nuevo mensaje de PQRSF</h2>
-        <ul>
-          <li><b>Nombre:</b> ${nombre}</li>
-          <li><b>Email:</b> ${email}</li>
-          <li><b>Teléfono:</b> ${telefono}</li>
-          <li><b>Sucursal:</b> ${sucursal}</li>
-          <li><b>Asunto:</b> ${asunto}</li>
-          <li><b>Mensaje:</b> ${mensaje}</li>
-          <li><b>Adjunto:</b> ${drive_file_url ? `<a href="${drive_file_url}">Ver en Drive</a>` : 'No adjunto'}</li>
-          <li><b>Fecha:</b> ${nowISO()}</li>
-        </ul>`
-    });
+    if (process.env.EMAIL_TO) {
+      await enviarCorreo({
+        to: [process.env.EMAIL_TO, process.env.EMAIL_CC].filter(Boolean),
+        subject: `[QUEJA] ${asunto || '(Sin asunto)'} - ${nombre || 'Usuario'}`,
+        html: `
+          <h2>Formulario de Quejas</h2>
+          <p><strong>Nombre:</strong> ${nombre || '-'}</p>
+          <p><strong>Email:</strong> ${email || '-'}</p>
+          <p><strong>Teléfono:</strong> ${telefono || '-'}</p>
+          <p><strong>Sucursal:</strong> ${sucursal || '-'}</p>
+          <p><strong>Asunto:</strong> ${asunto || '-'}</p>
+          <p><strong>Mensaje:</strong><br>${(mensaje || '').replace(/\n/g, '<br>')}</p>
+          ${fileUrl ? `<p><strong>Archivo:</strong> <a href="${fileUrl}" target="_blank">Ver archivo</a></p>` : ''}
+        `,
+      });
+    }
 
-    // El frontend espera texto
-    return res.status(200).send('OK');
-  } catch (err) {
-    console.error('Error /api/quejas:', err);
-    return res.status(500).send('Error del servidor.');
+    res.status(200).json({ ok: true, message: '✅ Queja enviada con éxito' });
+  } catch (error) {
+    console.error('❌ Error /api/quejas:', error);
+    res.status(500).json({ ok: false, message: '❌ Error al enviar la queja.' });
   }
 });
 
-// --- Estático (si sirves también el frontend con Express) ---
-app.use(express.static('public')); // o la carpeta donde tengas .html
+// Healthcheck sencillo
+app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
-// --- Arranque ---
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`Servidor escuchando en :${PORT}`);
+// Fallback SPA
+app.get('*', (_req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
+
+// Arranque
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`✅ Servidor escuchando en http://localhost:${PORT}`));

@@ -1,70 +1,24 @@
 {
-
-  "name": "pagina-web-demo",
-
+  "name": "casa-kumis-backend",
   "version": "1.0.0",
-
-  "main": "form-handler.js",
-
+  "description": "Backend de formularios (postulaciones y quejas)",
+  "main": "server.js",
+  "type": "commonjs",
   "scripts": {
-
-    "test": "echo \"Error: no test specified\" && exit 1",
-
-    "start": "node server.js",
-
-    "build": "echo 'skip build'"
-
+    "dev": "nodemon server.js",
+    "start": "node server.js"
   },
-
-  "repository": {
-
-    "type": "git",
-
-    "url": "git+https://github.com/otpvayne/Pagina-web-demo.git"
-
-  },
-
-  "keywords": [],
-
-  "author": "",
-
-  "license": "ISC",
-
-  "bugs": {
-
-    "url": "https://github.com/otpvayne/Pagina-web-demo/issues"
-
-  },
-
-  "homepage": "https://github.com/otpvayne/Pagina-web-demo#readme",
-
-  "description": "",
-
   "dependencies": {
-
-    "@libsql/client": "^0.15.4",
-
+    "@libsql/client": "^0.7.0",
     "cors": "^2.8.5",
-
-    "dotenv": "^16.5.0",
-
-    "express": "^5.1.0",
-
-    "googleapis": "^148.0.0",
-
-    "json2csv": "^6.0.0-alpha.2",
-
-    "multer": "^1.4.5-lts.2",
-
-    "nodemailer": "^7.0.5"
-
+    "dotenv": "^16.6.1",
+    "express": "^4.21.2",
+    "googleapis": "^128.0.0",
+    "json2csv": "^5.0.7",
+    "multer": "^1.4.5-lts.1",
+    "nodemailer": "^6.10.1"
   },
-
-  "engines": {
-
-    "node": "18.x"
-
+  "devDependencies": {
+    "nodemon": "^3.1.0"
   }
-
 }
-
